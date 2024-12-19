@@ -16,7 +16,7 @@ from itertools import islice
 load_dotenv()
 
 # Configuration
-COLLECTION_NAME = "news_headlines"
+COLLECTION_NAME = "news_headlines_debug"
 BATCH_SIZE = 50  # Number of items to process in one batch
 EMBEDDING_MODEL = "text-embedding-3-small"  # or "text-embedding-3-large" for better quality
 
@@ -228,6 +228,7 @@ class NewsVectorDB:
         self.logger.info(f"Starting cleanup of news older than {days_to_keep} days")
         try:
             cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+            cutoff_timestamp = cutoff_date.timestamp()  # Convert to timestamp
 
             await asyncio.to_thread(
                 self.qdrant.delete,
@@ -236,8 +237,8 @@ class NewsVectorDB:
                     filter=models.Filter(
                         must=[
                             models.FieldCondition(
-                                key="timestamp",
-                                range=models.Range(lt=cutoff_date)
+                                key="created_at",  # Use created_at field which stores timestamp
+                                range=models.Range(lt=cutoff_timestamp)  # Use timestamp instead of datetime
                             )
                         ]
                     )
