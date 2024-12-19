@@ -39,7 +39,7 @@ python news_rag_service.py
 ### Workflow Logic:
 
 1. News Ingestion Service (`news_ingestion_service.py`):
-![Alt Text](images\news_ingestion_service.png)
+![Alt Text](images/news_ingestion_service.png)
 
 2. News RAG Service (`news_rag_service.py`):
-![Alt Text](images\news_rag_service.png)
+![Alt Text](images/news_rag_service.png)
