@@ -1,0 +1,5 @@
+python-dotenv
+openai
+qdrant-client
+aiohttp
+tiktoken
