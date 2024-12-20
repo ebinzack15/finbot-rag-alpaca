@@ -1,7 +1,10 @@
+import logging
+from logging.handlers import RotatingFileHandler
+import sys
+
 import os
-import json
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List
 import requests
 import openai
 from dotenv import load_dotenv
@@ -15,6 +18,37 @@ from bytewax.inputs import FixedPartitionedSource, StatefulSourcePartition, Dyna
 
 # Load environment variables
 load_dotenv()
+
+def setup_logging(log_level=logging.DEBUG):
+    """Configure logging for both file and console output"""
+
+    # Create logger
+    logger = logging.getLogger('news_ingestion')
+    logger.setLevel(log_level)
+
+    # Formatting
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    # Console Handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # File Handler with rotation
+    file_handler = RotatingFileHandler(
+        'news_ingestion.log',
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    return logger
+
+# Initialize logger
+logger = setup_logging()
 
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
@@ -46,52 +80,62 @@ class AlpacaNewsPartition(StatefulSourcePartition[Dict, Dict]):
     """A stateful partition that fetches Alpaca news since the last processed timestamp."""
 
     def __init__(self, api_key: str, secret_key: str, resume_state: Optional[Dict]):
+        logger.info("Initializing AlpacaNewsPartition")
         self.api_key = api_key
         self.secret_key = secret_key
         self.session = requests.Session()
+        # Add headers initialization here
+        self.headers = {
+            'APCA-API-KEY-ID': self.api_key,
+            'APCA-API-SECRET-KEY': self.secret_key
+        }
         self.buffer = []
         self.poll_interval = timedelta(seconds=60)  # Poll every 60s
         self.last_awake = datetime.now(timezone.utc)
 
         if resume_state and "last_processed_timestamp" in resume_state:
             self.last_processed_timestamp = datetime.fromisoformat(resume_state["last_processed_timestamp"])
+            logger.info(f"Resuming from timestamp: {self.last_processed_timestamp}")
         else:
             # Start from None (fetch latest)
+            logger.info("Starting from latest (no resume state)")
             self.last_processed_timestamp = None
 
     def next_batch(self) -> List[Dict]:
-        # If we have a buffer of items, return them first
-        if self.buffer:
-            batch, self.buffer = self.buffer, []
-            return batch
+        try:
+            if self.buffer:
+                batch, self.buffer = self.buffer, []
+                logger.debug(f"Returning buffered batch of {len(batch)} items")
+                return batch
 
-        # Fetch new news
-        params = {}
-        if self.last_processed_timestamp is not None:
-            params['since'] = self.last_processed_timestamp.isoformat()
+            params = {}
+            if self.last_processed_timestamp is not None:
+                params['since'] = self.last_processed_timestamp.isoformat()
 
-        url = "https://data.alpaca.markets/v1beta1/news"
-        headers = {
-            "APCA-API-KEY-ID": self.api_key,
-            "APCA-API-SECRET-KEY": self.secret_key
-        }
+            url = "https://data.alpaca.markets/v1beta1/news"
+            logger.debug(f"Fetching news with params: {params}")
 
-        resp = self.session.get(url, headers=headers, params=params)
-        if resp.status_code != 200:
-            # Could not fetch now, return empty and try again next time
+            resp = self.session.get(url, headers=self.headers, params=params)
+            if resp.status_code != 200:
+                logger.error(f"Failed to fetch news: status={resp.status_code}, response={resp.text}")
+                return []
+
+            data = resp.json()
+            news = data.get('news', [])
+
+            if news:
+                logger.info(f"Fetched {len(news)} new articles")
+                self.last_processed_timestamp = datetime.fromisoformat(
+                    news[0]['created_at'].replace('Z', '+00:00')
+                )
+            else:
+                logger.debug("No new articles found")
+
+            return news
+
+        except Exception as e:
+            logger.exception("Error in next_batch")
             return []
-
-        data = resp.json()
-        news = data.get('news', [])
-
-        if not news:
-            # No new news
-            return []
-
-        # Update last_processed_timestamp
-        # Alpaca returns newest first
-        self.last_processed_timestamp = datetime.fromisoformat(news[0]['created_at'].replace('Z', '+00:00'))
-        return news
 
     def next_awake(self) -> Optional[datetime]:
         # Only call next_batch once every poll_interval
@@ -189,11 +233,17 @@ class QdrantOutput(FixedPartitionedSink):
 
 # --- Embedding and Processing ---
 def get_embedding(text: str) -> List[float]:
-    response = openai.Embedding.create(
-        model=EMBEDDING_MODEL,
-        input=[text]
-    )
-    return response["data"][0]["embedding"]
+    try:
+        logger.debug(f"Getting embedding for text of length {len(text)}")
+        response = openai.Embedding.create(
+            model=EMBEDDING_MODEL,
+            input=[text]
+        )
+        logger.debug("Successfully obtained embedding")
+        return response["data"][0]["embedding"]
+    except Exception as e:
+        logger.exception("Error getting embedding")
+        raise
 
 def prepare_text(item: Dict):
     text = f"Headline: {item['headline']} Summary: {item['summary']}"
@@ -220,24 +270,32 @@ def to_qdrant_point(item_with_embed):
     }
 
 def run_cleanup(_):
-    # Remove news older than 7 days
-    days_to_keep = 7
-    cutoff_date = datetime.now() - timedelta(days=days_to_keep)
-    cutoff_timestamp = cutoff_date.timestamp()
-    qdrant.delete(
-        collection_name=COLLECTION_NAME,
-        points_selector=models.FilterSelector(
-            filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="created_at",
-                        range=models.Range(lt=cutoff_timestamp)
-                    )
-                ]
+    try:
+        days_to_keep = 7
+        cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+        cutoff_timestamp = cutoff_date.timestamp()
+
+        logger.info(f"Running cleanup for data older than {cutoff_date}")
+
+        result = qdrant.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="created_at",
+                            range=models.Range(lt=cutoff_timestamp)
+                        )
+                    ]
+                )
             )
         )
-    )
-    return {"status": "cleanup_done", "cutoff": cutoff_date.isoformat()}
+
+        logger.info(f"Cleanup completed: {result}")
+        return {"status": "cleanup_done", "cutoff": cutoff_date.isoformat()}
+    except Exception as e:
+        logger.exception("Error during cleanup")
+        raise
 
 # Build the Bytewax Dataflow
 flow = Dataflow("news_ingestion_flow")
