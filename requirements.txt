@@ -3,3 +3,4 @@ openai
 qdrant-client
 aiohttp
 tiktoken
+bytewax
