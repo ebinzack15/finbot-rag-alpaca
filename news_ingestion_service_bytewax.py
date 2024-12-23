@@ -22,9 +22,17 @@ load_dotenv()
 def setup_logging(log_level=logging.DEBUG):
     """Configure logging for both file and console output"""
 
+    # Create logs directory if it doesn't exist
+    log_dir = 'logs'
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+
     # Create logger
     logger = logging.getLogger('news_ingestion')
     logger.setLevel(log_level)
+
+    # Clear any existing handlers
+    logger.handlers = []
 
     # Formatting
     formatter = logging.Formatter(
@@ -38,7 +46,7 @@ def setup_logging(log_level=logging.DEBUG):
 
     # File Handler with rotation
     file_handler = RotatingFileHandler(
-        'news_ingestion.log',
+        os.path.join(log_dir, 'news_ingestion_bytewax.log'),
         maxBytes=10*1024*1024,  # 10MB
         backupCount=5
     )
@@ -56,7 +64,7 @@ ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-COLLECTION_NAME = "news_headlines_debug"
+COLLECTION_NAME = "news_headlines_debug_bytewax"
 EMBEDDING_MODEL = "text-embedding-ada-002"
 
 openai.api_key = OPENAI_API_KEY
@@ -205,22 +213,48 @@ class QdrantSink(StatefulSinkPartition):
     def __init__(self):
         self.client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
         self.batch = []
+        self.batch_size = 10  # Reduced batch size for more frequent writes
+        self.last_flush = datetime.now()
+        self.flush_interval = timedelta(seconds=5)  # Force flush every 5 seconds
+        logger.info("Initialized QdrantSink")
 
     def write_batch(self, items):
+        logger.info(f"Adding {len(items)} items to batch (current batch size: {len(self.batch)})")
         self.batch.extend(items)
-        if len(self.batch) >= 50:
+
+        # Flush if batch size reached or time interval exceeded
+        if (len(self.batch) >= self.batch_size or
+            datetime.now() - self.last_flush > self.flush_interval):
             self.flush()
 
     def flush(self):
         if self.batch:
-            self.client.upsert(collection_name=COLLECTION_NAME, points=self.batch)
-            self.batch.clear()
+            logger.info(f"Flushing batch of {len(self.batch)} items to Qdrant")
+            try:
+                self.client.upsert(collection_name=COLLECTION_NAME, points=self.batch)
+                logger.info("Successfully flushed batch to Qdrant")
+                self.batch.clear()
+                self.last_flush = datetime.now()
+            except Exception as e:
+                logger.exception("Error flushing batch to Qdrant")
+                raise
 
-    def snapshot(self):
-        return None
+    def snapshot(self) -> dict:
+        """
+        Return the current state of the sink that needs to be preserved.
+        This method is required for StatefulSinkPartition.
+        """
+        return {
+            "last_flush": self.last_flush.isoformat(),
+            "batch_size": len(self.batch)
+        }
 
     def close(self):
-        self.flush()
+        """
+        Clean up resources when the sink is closed.
+        """
+        self.flush()  # Flush any remaining items
+        self.client.close()
 
 
 class QdrantOutput(FixedPartitionedSink):
@@ -234,12 +268,12 @@ class QdrantOutput(FixedPartitionedSink):
 # --- Embedding and Processing ---
 def get_embedding(text: str) -> List[float]:
     try:
-        logger.debug(f"Getting embedding for text of length {len(text)}")
+        logger.info(f"Getting embedding for text: {text[:100]}...")
         response = openai.Embedding.create(
             model=EMBEDDING_MODEL,
             input=[text]
         )
-        logger.debug("Successfully obtained embedding")
+        logger.info("Successfully obtained embedding")
         return response["data"][0]["embedding"]
     except Exception as e:
         logger.exception("Error getting embedding")
@@ -251,6 +285,7 @@ def prepare_text(item: Dict):
 
 def to_qdrant_point(item_with_embed):
     original_item, embedding = item_with_embed
+    logger.debug(f"Converting item to Qdrant point: {original_item['headline']}")
     created_at = datetime.fromisoformat(original_item['created_at'].replace('Z', '+00:00'))
     point_id = int(original_item['id'])
     payload = {
@@ -263,6 +298,7 @@ def to_qdrant_point(item_with_embed):
         "url": original_item.get('url', ''),
         "created_at": created_at.timestamp()
     }
+    logger.debug(f"Successfully created Qdrant point with ID: {point_id}")
     return {
         "id": point_id,
         "vector": embedding,
@@ -303,11 +339,25 @@ flow = Dataflow("news_ingestion_flow")
 # News input
 news_stream = op.input("alpaca_news_in", flow, AlpacaNewsSource())
 
+def safe_prepare_text(item):
+    try:
+        return prepare_text(item)
+    except Exception as e:
+        logger.exception(f"Error preparing text for item: {item}")
+        raise
+
+def safe_to_qdrant_point(item):
+    try:
+        return to_qdrant_point(item)
+    except Exception as e:
+        logger.exception(f"Error converting to Qdrant point: {item}")
+        raise
+
 # Prepare text and compute embeddings
-prepared = op.map("prepare_text", news_stream, prepare_text)
+prepared = op.map("prepare_text", news_stream, safe_prepare_text)
 embedded = op.map("compute_embedding", prepared, lambda x: (x[0], get_embedding(x[1])))
 # after to_qdrant_point map
-qdrant_points = op.map("to_qdrant_point", embedded, to_qdrant_point)
+qdrant_points = op.map("to_qdrant_point", embedded, safe_to_qdrant_point)
 
 # Add a key so the sink knows which partition to use
 keyed_points = op.map("add_partition_key", qdrant_points, lambda p: ("single", p))
