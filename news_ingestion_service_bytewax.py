@@ -36,7 +36,8 @@ def setup_logging(log_level=logging.DEBUG):
 
     # Formatting
     formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        '%(asctime)s - %(name)s - %(levelname)s - '
+        '[%(filename)s:%(lineno)d] - %(message)s'
     )
 
     # Console Handler
@@ -99,6 +100,7 @@ class AlpacaNewsPartition(StatefulSourcePartition[Dict, Dict]):
         }
         self.buffer = []
         self.poll_interval = timedelta(seconds=60)  # Poll every 60s
+        logger.info(f"Initialized AlpacaNewsPartition with poll interval: {self.poll_interval}")
         self.last_awake = datetime.now(timezone.utc)
 
         if resume_state and "last_processed_timestamp" in resume_state:
@@ -111,6 +113,8 @@ class AlpacaNewsPartition(StatefulSourcePartition[Dict, Dict]):
 
     def next_batch(self) -> List[Dict]:
         try:
+            logger.debug("Starting next_batch poll cycle")
+
             if self.buffer:
                 batch, self.buffer = self.buffer, []
                 logger.debug(f"Returning buffered batch of {len(batch)} items")
@@ -119,9 +123,12 @@ class AlpacaNewsPartition(StatefulSourcePartition[Dict, Dict]):
             params = {}
             if self.last_processed_timestamp is not None:
                 params['since'] = self.last_processed_timestamp.isoformat()
+                logger.debug(f"Polling for news since: {self.last_processed_timestamp}")
+            else:
+                logger.debug("Polling for latest news (no timestamp filter)")
 
             url = "https://data.alpaca.markets/v1beta1/news"
-            logger.debug(f"Fetching news with params: {params}")
+            logger.debug(f"Making API request to: {url}")
 
             resp = self.session.get(url, headers=self.headers, params=params)
             if resp.status_code != 200:
@@ -136,8 +143,9 @@ class AlpacaNewsPartition(StatefulSourcePartition[Dict, Dict]):
                 self.last_processed_timestamp = datetime.fromisoformat(
                     news[0]['created_at'].replace('Z', '+00:00')
                 )
+                logger.debug(f"Updated last_processed_timestamp to: {self.last_processed_timestamp}")
             else:
-                logger.debug("No new articles found")
+                logger.debug("Poll completed: No new articles found")
 
             return news
 
@@ -146,10 +154,13 @@ class AlpacaNewsPartition(StatefulSourcePartition[Dict, Dict]):
             return []
 
     def next_awake(self) -> Optional[datetime]:
-        # Only call next_batch once every poll_interval
         now = datetime.now(timezone.utc)
         if now < self.last_awake + self.poll_interval:
-            return self.last_awake + self.poll_interval
+            next_wake = self.last_awake + self.poll_interval
+            logger.debug(f"Sleeping until next poll at: {next_wake}")
+            return next_wake
+
+        logger.debug("Poll interval elapsed, proceeding with next poll")
         self.last_awake = now
         return None
 
